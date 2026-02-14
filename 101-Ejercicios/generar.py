@@ -32,8 +32,12 @@ Requisitos:
 
 from __future__ import annotations
 
+import argparse
 import json
+import logging
+import os
 import re
+import sys
 import time
 import sqlite3
 from dataclasses import dataclass
@@ -43,18 +47,26 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 
+# Logging configurado con formato legible
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
 
 # =========================
 # CONFIG
 # =========================
-MODEL = "qwen2.5:7b-instruct-q4_0"
-OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct-q4_0")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DOCS_DIR = SCRIPT_DIR / "documentos"
 DB_PATH = SCRIPT_DIR / "blog.sqlite"
 
-REQUEST_TIMEOUT = 240
+REQUEST_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "240"))
 RETRIES = 3
 SLEEP_BETWEEN_CALLS = 0.6
 
@@ -225,6 +237,7 @@ def extract_hierarchy_items(md_body: str, file_stem: str) -> List[H3Item]:
 
 
 def ollama_generate(prompt: str) -> str:
+    """Llama a Ollama y devuelve el texto generado, con reintentos."""
     payload = {
         "model": MODEL,
         "prompt": prompt,
@@ -236,7 +249,7 @@ def ollama_generate(prompt: str) -> str:
         },
     }
 
-    last_err = None
+    last_err: Optional[Exception] = None
     for attempt in range(1, RETRIES + 1):
         try:
             r = requests.post(OLLAMA_URL, json=payload, timeout=REQUEST_TIMEOUT)
@@ -246,9 +259,16 @@ def ollama_generate(prompt: str) -> str:
             if not isinstance(text, str) or not text.strip():
                 raise RuntimeError("Respuesta vacía de Ollama.")
             return text.strip()
+        except requests.ConnectionError:
+            log.warning("Ollama no disponible (intento %d/%d)", attempt, RETRIES)
+            last_err = ConnectionError("No se pudo conectar a Ollama")
+        except requests.Timeout:
+            log.warning("Timeout en Ollama (intento %d/%d)", attempt, RETRIES)
+            last_err = TimeoutError(f"Timeout tras {REQUEST_TIMEOUT}s")
         except Exception as e:
+            log.warning("Error en Ollama (intento %d/%d): %s", attempt, RETRIES, e)
             last_err = e
-            time.sleep(1.0 * attempt)
+        time.sleep(1.5 * attempt)
 
     raise RuntimeError(f"Fallo llamando a Ollama tras {RETRIES} intentos: {last_err}")
 
@@ -285,7 +305,29 @@ REGLAS:
 # =========================
 # MAIN
 # =========================
+def parse_args() -> argparse.Namespace:
+    """Parsea argumentos de línea de comandos."""
+    parser = argparse.ArgumentParser(
+        description="Genera artículos de blog desde Markdown usando Ollama."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Solo muestra qué artículos se generarían, sin llamar a Ollama.",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Activa logging de nivel DEBUG.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
     if not DOCS_DIR.is_dir():
         raise SystemExit(f"ERROR: No existe la carpeta: {DOCS_DIR}")
 
@@ -293,34 +335,38 @@ def main() -> None:
 
     md_files = sorted([p for p in DOCS_DIR.glob("*.md") if p.is_file()])
     if not md_files:
-        print(f"No se encontraron .md en {DOCS_DIR}")
+        log.info("No se encontraron .md en %s", DOCS_DIR)
         return
 
-    print(f"Encontrados {len(md_files)} archivos en {DOCS_DIR}")
-    print(f"DB: {DB_PATH}")
-    print(f"Modelo: {MODEL}")
+    log.info("Encontrados %d archivos en %s", len(md_files), DOCS_DIR)
+    log.info("DB: %s | Modelo: %s", DB_PATH, MODEL)
+    if args.dry_run:
+        log.info(">>> MODO DRY-RUN: no se generará ni insertará nada <<<")
     print("-" * 70)
 
+    t_start = time.monotonic()
     conn = sqlite3.connect(str(DB_PATH))
     try:
         inserted = 0
         skipped = 0
+        from_cache = 0
+        errors = 0
 
-        for md_path in md_files:
+        for file_idx, md_path in enumerate(md_files, 1):
             raw = read_text(md_path)
             _fm, body = extract_front_matter(raw)
 
-            # Categoría base: nombre del archivo sin extensión (tal como pides)
-            file_stem = md_path.stem.strip()
-            if not file_stem:
-                file_stem = md_path.name
+            file_stem = md_path.stem.strip() or md_path.name
 
             items = extract_hierarchy_items(body, file_stem=file_stem)
             if not items:
-                print(f"[SKIP] {md_path.name}: no hay headings ###")
+                log.debug("[SKIP] %s: no hay headings ###", md_path.name)
                 continue
 
-            print(f"\n[{md_path.name}] H3 encontrados: {len(items)}")
+            log.info(
+                "[%d/%d] %s — %d artículos posibles",
+                file_idx, len(md_files), md_path.name, len(items),
+            )
 
             full_doc_for_context = raw.strip()
 
@@ -330,7 +376,11 @@ def main() -> None:
 
                 if post_exists(conn, title, category):
                     skipped += 1
-                    print(f"  - (skip) Ya existe: [{category}] {title}")
+                    log.debug("  (skip) Ya existe: [%s] %s", category, title)
+                    continue
+
+                if args.dry_run:
+                    log.info("  [DRY] Generaría: [%s] %s", category, title)
                     continue
 
                 ck = cache_key(md_path, title, category)
@@ -340,18 +390,26 @@ def main() -> None:
                         content_md = (cached.get("content") or "").strip()
                         if content_md:
                             insert_post(conn, title, content_md, category)
+                            from_cache += 1
                             inserted += 1
-                            print(f"  - (cache→db) [{category}] {title}")
+                            log.info("  (cache→db) %s", title)
                             continue
-                    except Exception:
-                        pass
+                    except (json.JSONDecodeError, KeyError) as exc:
+                        log.warning("  Cache corrupta para %s: %s", title, exc)
 
-                print(f"  - (gen) [{category}] {title}")
-                prompt = build_prompt(full_doc_for_context, category, title)
-                content_md = ollama_generate(prompt)
+                log.info("  (gen) %s", title)
+                try:
+                    prompt = build_prompt(full_doc_for_context, category, title)
+                    content_md = ollama_generate(prompt)
+                except RuntimeError as exc:
+                    log.error("  ERROR generando '%s': %s", title, exc)
+                    errors += 1
+                    continue
 
                 if len(content_md.strip()) < 200:
-                    raise RuntimeError(f"Contenido demasiado corto generado para: {title}")
+                    log.warning("  Contenido demasiado corto para: %s (%d chars)", title, len(content_md))
+                    errors += 1
+                    continue
 
                 ck.write_text(
                     json.dumps(
@@ -374,10 +432,13 @@ def main() -> None:
                 inserted += 1
                 time.sleep(SLEEP_BETWEEN_CALLS)
 
+        elapsed = time.monotonic() - t_start
         print("\n" + "=" * 70)
-        print(f"Insertados: {inserted}")
-        print(f"Saltados (ya existían): {skipped}")
-        print(f"Cache: {CACHE_DIR}")
+        log.info("Insertados: %d  (desde cache: %d)", inserted, from_cache)
+        log.info("Saltados (ya existían): %d", skipped)
+        log.info("Errores: %d", errors)
+        log.info("Tiempo total: %.1f s", elapsed)
+        log.info("Cache: %s", CACHE_DIR)
         print("=" * 70)
 
     finally:
